@@ -10,6 +10,7 @@ class PullRequestService {
     ): Promise<{ total: number, items: PullRequestDTO[] } | undefined> {
         try {
             const response = await axios.get(`${PR_API_URL}/detail/search`, { params: { limit, offset } })
+            console.log(`response`, response)
             const rawData: any = JSON.parse(response.data)
             const total: number | undefined = rawData.total
             const rawItems: any = rawData.items

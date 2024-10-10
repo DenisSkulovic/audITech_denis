@@ -1,178 +1,166 @@
 import os
 import json
-import psycopg2
+import pg8000
 
-class PullRequestRepository():
-        
-    def _get_db_connection():
-        DB_HOST = os.environ['DB_HOST']
-        DB_USER = os.environ['DB_USER']
-        DB_PASSWORD = os.environ['DB_PASSWORD']
-        DB_NAME = os.environ['DB_NAME']
-        return psycopg2.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            cursorclass=pymysql.cursors.DictCursor
+class PullRequestRepository:
+    def _get_db_connection(self, kind):
+        if not kind:
+            raise ValueError("kind is mandatory for DB connection - 'write' or 'read'")
+        if kind == "write":
+            db_host = os.environ['AURORA_POSTGRES__WRITER_ENDPOINT']
+        else:
+            db_host = os.environ['AURORA_POSTGRES__READER_ENDPOINT']
+
+        db_user = os.environ['AURORA_POSTGRES__USERNAME']
+        db_password = os.environ['AURORA_POSTGRES__PASSWORD']
+        db_name = os.environ['AURORA_POSTGRES__DATABASE']
+        db_port = int(os.environ['AURORA_POSTGRES__PORT'])
+
+        connection = pg8000.connect(
+            database=db_name,
+            user=db_user,
+            password=db_password,
+            host=db_host,
+            port=db_port
         )
-        
-    def _perform_query(self, query, args=None):
-        connection = self._get_db_connection()
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(query, args)
-                result = cursor.fetchall()
-                return result
-        finally:
-            connection.close()
-    
-    def store_pr_event(self, pr_event):
-        pr_title = pr_event['pull_request']['title']
-        author = pr_event['pull_request']['user']['login']
-        state = pr_event['pull_request']['state']
-        source_branch = pr_event['pull_request']['head']['ref']
-        target_branch = pr_event['pull_request']['base']['ref']
-        pr_url = pr_event['pull_request']['html_url']
-        created_at = pr_event['pull_request']['created_at']
-        raw_event = json.dumps(pr_event)
-        
-        args = (pr_title, author, state, source_branch, target_branch, pr_url, created_at, raw_event)
-        query = """
-                    INSERT INTO pull_requests 
-                    (pr_number, pr_title, author, state, source_branch, target_branch, pr_url, created_at, raw_event)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
-                """
+        return connection
 
-        query_result = self._perform_query(query, args)
-        return query_result
-    
-    def list_pr_events(self, limit, offset):
-        args = (limit, offset)
+    def _perform_query(self, kind, query, args=None):
+        connection = self._get_db_connection(kind)
+        try:
+            cursor = connection.cursor()
+            cursor.execute(query, args)
+            if query.strip().lower().startswith('select'):
+                rows = cursor.fetchall()
+                colnames = [desc[0] for desc in cursor.description]
+                result = [dict(zip(colnames, row)) for row in rows]
+                return result
+            else:
+                connection.commit()
+                return None
+        except Exception as e:
+            print(f"Database query failed: {e}")
+            raise e
+        finally:
+            cursor.close()
+            connection.close()
+
+    def store_pr_event(self, pr_event):
+        print("entered store function")
+        pr_number = pr_event.get('number', 12345)
+        pr_title = pr_event['head_commit']['message']
+        author = pr_event['pusher']['name']
+        state = pr_event.get('state', "open") 
+        source_branch = pr_event['ref'].split('/')[-1]
+        target_branch = pr_event.get('base', {}).get('ref', "master")
+        pr_url = pr_event['repository']['html_url']
+        created_at = pr_event['head_commit']['timestamp']
+        raw_event = json.dumps(pr_event)
+        print("finished collecting data")
+
+        args = (
+            pr_number, pr_title, author, state,
+            source_branch, target_branch, pr_url,
+            created_at, raw_event
+        )
+
         query = """
-                    SELECT id, pr_title, author, state, source_branch, target_branch, pr_url, created_at
-                    FROM pull-request-details
-                    ORDER BY created_at DESC
-                    LIMIT %s OFFSET %s;
-                """
-        query_result = self._perform_query(query, args)
-        return query_result
+            INSERT INTO pull_requests 
+            (pr_number, pr_title, author, state, source_branch, target_branch, pr_url, created_at, raw_event)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """
+
+        self._perform_query("write", query, args)
+
+    def list_pr_events(self, limit, offset):
+        try:
+            query = """
+                SELECT
+                    id,
+                    pr_number,
+                    pr_title,
+                    author,
+                    state,
+                    source_branch,
+                    target_branch,
+                    pr_url,
+                    created_at,
+                    COUNT(*) OVER() AS total_count
+                FROM pull_requests
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s;
+            """
+            args = (limit, offset)
+            rows = self._perform_query("read", query, args)
+
+            if not rows:
+                return {"items": [], "total": 0}
+
+            total = rows[0].get('total_count', 0) # extracts the total of all entries from the first row.
+            items = [{k: v for k, v in row.items() if k != 'total_count'} for row in rows] # removes total from items
+
+            return {"items": items, "total": total}
+
+        except Exception as e:
+            print(f"Error in list_pr_events: {e}")
+            raise e
+
     
-        
+    
 # {
-#   "action": "opened",  // The action performed (e.g., opened, closed, reopened)
-#   "number": 42,        // The pull request number
-#   "pull_request": {
-#     "id": 12345678,            // The pull request ID
-#     "url": "https://api.github.com/repos/username/repo/pulls/42",
-#     "html_url": "https://github.com/username/repo/pull/42",
-#     "diff_url": "https://github.com/username/repo/pull/42.diff",
-#     "patch_url": "https://github.com/username/repo/pull/42.patch",
-#     "issue_url": "https://api.github.com/repos/username/repo/issues/42",
-#     "commits_url": "https://api.github.com/repos/username/repo/pulls/42/commits",
-#     "review_comments_url": "https://api.github.com/repos/username/repo/pulls/42/comments",
-#     "review_comment_url": "https://api.github.com/repos/username/repo/pulls/comments{/number}",
-#     "statuses_url": "https://api.github.com/repos/username/repo/statuses/abcdefg",
-#     "number": 42,              // Pull request number
-#     "state": "open",           // The current state of the pull request (e.g., open, closed)
-#     "locked": false,           // Whether the pull request is locked
-#     "title": "Update README",  // The pull request title
-#     "user": {                  // The user who created the pull request
-#       "login": "octocat",
-#       "id": 1,
-#       "avatar_url": "https://github.com/images/error/octocat_happy.gif",
-#       "gravatar_id": "",
-#       "url": "https://api.github.com/users/octocat",
-#       "html_url": "https://github.com/octocat",
-#       "type": "User"
-#     },
-#     "body": "Please pull these awesome changes",  // The pull request description
-#     "created_at": "2021-01-01T12:34:56Z",
-#     "updated_at": "2021-01-01T12:45:56Z",
-#     "closed_at": null,
-#     "merged_at": null,
-#     "merge_commit_sha": "abcdefg",     // SHA of the merge commit (if merged)
-#     "assignees": [],                   // Users assigned to the PR
-#     "requested_reviewers": [],         // Reviewers requested
-#     "head": {                          // The source branch information (where changes are coming from)
-#       "label": "username:feature-branch",
-#       "ref": "feature-branch",         // The branch name
-#       "sha": "abcdefg",                // Latest commit SHA in the source branch
-#       "user": {
-#         "login": "octocat",
-#         "id": 1,
-#         "avatar_url": "https://github.com/images/error/octocat_happy.gif"
-#       },
-#       "repo": {                        // The repository of the source branch
-#         "id": 123456,
-#         "name": "repo",
-#         "full_name": "username/repo",
-#         "private": false,
-#         "owner": {
-#           "login": "octocat",
-#           "id": 1,
-#           "avatar_url": "https://github.com/images/error/octocat_happy.gif"
-#         }
-#       }
-#     },
-#     "base": {                          // The target branch information (where changes will be merged into)
-#       "label": "username:main",
-#       "ref": "main",                   // The target branch name
-#       "sha": "xyz123",                 // Latest commit SHA in the target branch
-#       "user": {
-#         "login": "octocat",
-#         "id": 1,
-#         "avatar_url": "https://github.com/images/error/octocat_happy.gif"
-#       },
-#       "repo": {                        // The repository of the target branch
-#         "id": 123456,
-#         "name": "repo",
-#         "full_name": "username/repo",
-#         "private": false,
-#         "owner": {
-#           "login": "octocat",
-#           "id": 1,
-#           "avatar_url": "https://github.com/images/error/octocat_happy.gif"
-#         }
-#       }
-#     },
-#     "mergeable": true,          // Whether the pull request is mergeable
-#     "rebaseable": true,         // Whether the pull request can be rebased
-#     "merged": false,            // Whether the pull request has been merged
-#     "comments": 10,             // Number of comments on the pull request
-#     "review_comments": 2,       // Number of review comments
-#     "commits": 5,               // Number of commits in the pull request
-#     "additions": 100,           // Number of additions made in the pull request
-#     "deletions": 50,            // Number of deletions made in the pull request
-#     "changed_files": 3          // Number of changed files
-#   },
+#   "ref": "refs/heads/test-branch",
+#   "before": "0000000000000000000000000000000000000000",
+#   "after": "53466e6163eaeb84e288cd05238359de25669584",
 #   "repository": {
-#     "id": 123456,
-#     "name": "repo",
-#     "full_name": "username/repo",
-#     "owner": {
-#       "login": "octocat",
-#       "id": 1,
-#       "avatar_url": "https://github.com/images/error/octocat_happy.gif"
-#     },
+#     "id": 123456789,
+#     "name": "sample_repo",
+#     "full_name": "user/sample_repo",
 #     "private": false,
-#     "html_url": "https://github.com/username/repo",
-#     "description": "This is a repository",
-#     "fork": false,
-#     "created_at": "2020-12-25T12:34:56Z",
-#     "updated_at": "2021-01-01T12:34:56Z",
-#     "pushed_at": "2021-01-01T12:45:56Z",
-#     "default_branch": "main",
-#     "stargazers_count": 42,
-#     "forks_count": 10,
-#     "open_issues_count": 5
+#     "owner": {
+#       "login": "user",
+#       "id": 1001
+#     },
+#     "html_url": "https://github.com/user/sample_repo"
+#   },
+#   "pusher": {
+#     "name": "user",
+#     "email": "user@example.com"
 #   },
 #   "sender": {
-#     "login": "octocat",
-#     "id": 1,
-#     "avatar_url": "https://github.com/images/error/octocat_happy.gif",
-#     "url": "https://api.github.com/users/octocat",
-#     "html_url": "https://github.com/octocat",
-#     "type": "User"
+#     "login": "user",
+#     "id": 1001
+#   },
+#   "created": true,
+#   "deleted": false,
+#   "forced": false,
+#   "compare": "https://github.com/user/sample_repo/compare/commit1...commit2",
+#   "commits": [
+#     {
+#       "id": "8eb19ef1075d84829f2c8220a77b7f9e7f5e10ee",
+#       "message": "Initial commit",
+#       "timestamp": "2024-10-10T21:43:45+03:00",
+#       "author": {
+#         "name": "user",
+#         "email": "user@example.com"
+#       }
+#     },
+#     {
+#       "id": "53466e6163eaeb84e288cd05238359de25669584",
+#       "message": "Second commit",
+#       "timestamp": "2024-10-10T21:44:20+03:00",
+#       "author": {
+#         "name": "user",
+#         "email": "user@example.com"
+#       }
+#     }
+#   ],
+#   "head_commit": {
+#     "id": "53466e6163eaeb84e288cd05238359de25669584",
+#     "message": "Second commit",
+#     "timestamp": "2024-10-10T21:44:20+03:00",
+#     "author": {
+#       "name": "user",
+#       "email": "user@example.com"
+#     }
 #   }
 # }
