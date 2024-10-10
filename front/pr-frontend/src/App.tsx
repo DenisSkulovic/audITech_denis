@@ -12,7 +12,7 @@ const App: React.FC = () => {
   const { pullRequests, isLoading, error, total } = usePullRequests(LIMIT, offset)
 
   return (
-    <div>
+    <div className="container">
       <h1>GitHub Pull Requests</h1>
 
       {isLoading && <p>Loading...</p>}
